@@ -1,6 +1,7 @@
 import time
 import os
 from typing import List, Tuple
+import argparse
 
 import cv2
 import mss
@@ -154,6 +155,65 @@ def detect_with_yolo(image_bgr: np.ndarray, session: object, input_size: int, co
         return []
 
 
+def list_template_files(templates_dir: str) -> List[Tuple[str, str]]:
+    if not os.path.isdir(templates_dir):
+        return []
+    valid_exts = {".png", ".jpg", ".jpeg", ".bmp"}
+    files: List[Tuple[str, str]] = []
+    for root, _, filenames in os.walk(templates_dir):
+        for fname in filenames:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in valid_exts:
+                files.append((os.path.join(root, fname), fname))
+    return files
+
+
+def detect_with_templates(image_bgr: np.ndarray, templates_dir: str, threshold: float = 0.88, scales: List[float] | None = None) -> List[DetectedElement]:
+    if scales is None:
+        scales = [0.85, 0.95, 1.0, 1.05, 1.15]
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    files = list_template_files(templates_dir)
+    if not files:
+        return []
+
+    boxes: List[List[float]] = []
+    scores: List[float] = []
+    labels: List[str] = []
+
+    for path, filename in files:
+        label = os.path.splitext(filename)[0]
+        templ = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if templ is None:
+            continue
+        th, tw = templ.shape[:2]
+        for s in scales:
+            sw = max(8, int(tw * s))
+            sh = max(8, int(th * s))
+            if sw >= gray.shape[1] or sh >= gray.shape[0]:
+                continue
+            templ_s = cv2.resize(templ, (sw, sh), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR)
+            res = cv2.matchTemplate(gray, templ_s, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= threshold)
+            for y, x in zip(*loc):
+                score = float(res[y, x])
+                boxes.append([float(x), float(y), float(x + sw), float(y + sh)])
+                scores.append(score)
+                labels.append(label)
+
+    keep = nms_boxes(boxes, scores, 0.30)
+    out: List[DetectedElement] = []
+    for i in keep:
+        x1, y1, x2, y2 = boxes[i]
+        w = int(max(1, x2 - x1))
+        h = int(max(1, y2 - y1))
+        x = int(x1)
+        y = int(y1)
+        kind = labels[i]
+        out.append(DetectedElement(x, y, w, h, kind))
+    return out
+
+
 def detect_ui_elements(image_bgr: np.ndarray) -> List[DetectedElement]:
     original_h, original_w = image_bgr.shape[:2]
     scale = 0.6
@@ -216,7 +276,7 @@ def draw_elements_progressive(base_bgr: np.ndarray, elements: List[DetectedEleme
     for el in elements:
         if el.center_y <= scan_y:
             color = (0, 0, 255)
-            if el.kind == "button":
+            if el.kind == "button" or ("button" in el.kind.lower() or "postul" in el.kind.lower()):
                 color = (255, 0, 0)
             elif el.kind == "input":
                 color = (0, 200, 0)
@@ -233,7 +293,7 @@ def draw_elements_progressive(base_bgr: np.ndarray, elements: List[DetectedEleme
     return overlay
 
 
-def run():
+def run(target_filter: set | None = None):
     window_name = "Scan UI"
     model_path = os.path.join("models", "yolov10n-ui.onnx")
     session, input_sz = load_yolo_session(model_path)
@@ -245,6 +305,17 @@ def run():
             elements = detect_ui_elements(base_frame)
     else:
         elements = detect_ui_elements(base_frame)
+
+    # Template matching augmentation (directory: ./templates)
+    templates_dir = ARGS.templates_dir if 'ARGS' in globals() else 'templates'
+    template_thres = ARGS.template_thres if 'ARGS' in globals() else 0.88
+    template_scales = ARGS.template_scales if 'ARGS' in globals() else [0.85, 0.95, 1.0, 1.05, 1.15]
+    template_elements = detect_with_templates(base_frame, templates_dir, template_thres, template_scales)
+    if template_elements:
+        elements.extend(template_elements)
+
+    if target_filter:
+        elements = [e for e in elements if e.kind in target_filter]
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -266,6 +337,17 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", type=str, default="", help="comma-separated kinds to keep: button,input,component or template labels (e.g., postuler)")
+    parser.add_argument("--templates-dir", type=str, default="templates", help="directory containing template images")
+    parser.add_argument("--template-thres", dest="template_thres", type=float, default=0.88, help="template match threshold [0-1]")
+    parser.add_argument("--template-scales", dest="template_scales", type=str, default="0.85,0.95,1.0,1.05,1.15", help="comma-separated scales for template matching")
+    ARGS = parser.parse_args()
+    try:
+        ARGS.template_scales = [float(s.strip()) for s in ARGS.template_scales.split(',') if s.strip()]
+    except Exception:
+        ARGS.template_scales = [0.85, 0.95, 1.0, 1.05, 1.15]
+    target = set([t.strip() for t in ARGS.target.split(',') if t.strip()]) or None
+    run(target_filter=target)
 
 

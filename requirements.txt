@@ -1,5 +1,5 @@
 opencv-python==4.10.0.84
 mss==9.0.1
-numpy==2.0.2
+numpy==1.26.4
 onnxruntime==1.18.0
 
